@@ -80,5 +80,9 @@ out/
 
 .tokens/
 .token/
+
+
+.tokens.json
+.client.json
 oauth_tokens.json
 client_info.json
