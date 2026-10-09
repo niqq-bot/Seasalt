@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import webbrowser
 from pathlib import Path
 
@@ -11,6 +12,8 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.client.auth import OAuthClientProvider
 from mcp.client.auth.oauth2 import TokenStorage
 from mcp.shared.auth import OAuthClientMetadata
+
+from gemma import GemmaService
 
 
 # ============================================================
@@ -470,108 +473,362 @@ def get_restaurant_id(restaurant):
 
 
 # ============================================================
-# Menu helpers
+# Menu extraction, validation, and adventure display
 # ============================================================
 
-def display_menu(result):
+def _first_present(mapping, *keys):
+    """Return the first non-None, non-empty value from a mapping."""
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None and value != "":
+            return value
+    return None
 
-    print()
-    print("===================================")
-    print("          RESTAURANT MENU")
-    print("===================================")
-    print()
 
-    if not result.structured_content:
+def _numeric_value(value):
+    """Convert a numeric or rupee-formatted value to float; otherwise None."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        value = _first_present(value, "amount", "value", "price", "finalPrice")
+        if value is None:
+            return None
+    match = re.search(r"\d+(?:\.\d+)?", str(value).replace(",", ""))
+    return float(match.group()) if match else None
 
-        print(
-            "No structured menu response."
-        )
 
-        return
+def _display_number(value):
+    if value is None:
+        return None
+    return int(value) if float(value).is_integer() else round(float(value), 2)
 
-    data = result.structured_content
 
-    categories = data.get(
-        "categories",
-        []
+def _extract_menu_items(categories):
+    """Flatten simple and nested Swiggy menu categories into menu items."""
+    items = []
+
+    def visit_category(category):
+        if not isinstance(category, dict):
+            return
+
+        category_items = category.get("items", [])
+        if isinstance(category_items, list):
+            for item in category_items:
+                if not isinstance(item, dict):
+                    continue
+
+                name = _first_present(item, "name", "itemName", "title")
+                price_value = _first_present(
+                    item, "price", "itemPrice", "finalPrice", "defaultPrice"
+                )
+                price = _numeric_value(price_value)
+                veg = item.get("isVeg", item.get("veg"))
+
+                if name:
+                    items.append({
+                        "name": str(name).strip(),
+                        "price": _display_number(price),
+                        "isVeg": veg if isinstance(veg, bool) else None,
+                    })
+
+        for child_key in ("subcategories", "categories", "children"):
+            children = category.get(child_key, [])
+            if isinstance(children, list):
+                for child in children:
+                    visit_category(child)
+
+    if isinstance(categories, list):
+        for category in categories:
+            visit_category(category)
+
+    # Avoid duplicate entries if a nested response repeats an item.
+    unique = []
+    seen = set()
+    for item in items:
+        key = (item["name"].casefold(), item["price"], item["isVeg"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def _restaurant_distance(restaurant):
+    value = _first_present(restaurant, "distanceKm", "distance")
+    distance = _numeric_value(value)
+    return _display_number(distance)
+
+
+def _restaurant_name(restaurant):
+    return str(
+        _first_present(restaurant, "name", "restaurantName")
+        or "Unknown restaurant"
     )
 
-    if not categories:
 
-        print(
-            "No menu categories returned."
-        )
+def _restaurant_id(restaurant):
+    value = _first_present(restaurant, "restaurantId", "id", "restaurant_id")
+    return str(value) if value is not None else None
 
-        print()
 
-        print(
-            json.dumps(
-                data,
-                indent=2,
-                default=str
+def _build_restaurant_payload(restaurant, menu_result):
+    """Create a compact, normalized payload for Gemma from real Swiggy data."""
+    data = menu_result.structured_content or {}
+    categories = data.get("categories", [])
+    menu_items = _extract_menu_items(categories)
+
+    # We need a real price to validate a generated stop and its total cost.
+    menu_items = [item for item in menu_items if item["price"] is not None]
+
+    return {
+        "name": _restaurant_name(restaurant),
+        "restaurantId": _restaurant_id(restaurant),
+        "availabilityStatus": str(
+            restaurant.get("availabilityStatus", "UNKNOWN")
+        ).upper(),
+        "distanceKm": _restaurant_distance(restaurant),
+        "menu": menu_items,
+    }
+
+
+def validate_route_plan(plan, restaurant_data, craving_profile):
+    """Validate Gemma's choices against Swiggy data and recalculate totals."""
+    warnings = list(plan.get("warnings") or [])
+    if not isinstance(warnings, list):
+        warnings = [str(warnings)]
+
+    restaurants_by_id = {
+        str(restaurant.get("restaurantId")): restaurant
+        for restaurant in restaurant_data
+        if restaurant.get("restaurantId") is not None
+    }
+    requested_stops = _numeric_value(craving_profile.get("stops")) or 3
+    requested_stops = max(1, int(requested_stops))
+    budget = _numeric_value(craving_profile.get("budget_inr"))
+
+    max_distance = _numeric_value(
+        craving_profile.get("max_distance_km")
+    )
+
+    validated_stops = []
+    for stop in plan.get("stops", []):
+        if not isinstance(stop, dict):
+            warnings.append("A malformed stop from the generated plan was removed.")
+            continue
+
+        restaurant_id = stop.get("restaurant_id")
+        restaurant = restaurants_by_id.get(str(restaurant_id))
+        if not restaurant or restaurant.get("availabilityStatus") != "OPEN":
+            warnings.append(
+                f"Removed stop {stop.get('stop_number', '?')}: restaurant was not verified as OPEN in the supplied Swiggy data."
             )
-        )
+            continue
 
-        return
+        # Enforce the user's maximum distance using Swiggy data.
+        distance = _numeric_value(restaurant.get("distanceKm"))
 
-    for category in categories:
-
-        category_name = (
-            category.get("name")
-            or category.get(
-                "categoryName"
-            )
-            or "Category"
-        )
-
-        print(
-            f"--- {category_name} ---"
-        )
-
-        items = category.get(
-            "items",
-            []
-        )
-
-        for item in items:
-
-            item_name = (
-                item.get("name")
-                or item.get("itemName")
-                or "Unknown item"
-            )
-
-            price = (
-                item.get("price")
-                or item.get("itemPrice")
-                or "N/A"
-            )
-
-            veg = item.get(
-                "isVeg",
-                item.get(
-                    "veg",
-                    None
+        if max_distance is not None:
+            if distance is None:
+                warnings.append(
+                    f"Removed {restaurant['name']}: distance could not be verified."
                 )
+                continue
+
+            if distance > max_distance:
+                warnings.append(
+                    f"Removed {restaurant['name']}: "
+                    f"{_display_number(distance)} km exceeds "
+                    f"your {_display_number(max_distance)} km limit."
+                )
+                continue
+
+        requested_name = str(stop.get("dish_name") or "").strip().casefold()
+        menu_item = next(
+            (item for item in restaurant.get("menu", [])
+             if str(item.get("name", "")).strip().casefold() == requested_name),
+            None,
+        )
+        if not menu_item:
+            warnings.append(
+                f"Removed a dish from {restaurant['name']} because it was not found in the fetched menu."
+            )
+            continue
+
+        price = _numeric_value(menu_item.get("price"))
+        if price is None:
+            warnings.append(
+                f"Removed {menu_item['name']} because its price could not be verified."
+            )
+            continue
+
+        validated_stops.append({
+            "stop_number": len(validated_stops) + 1,
+            "restaurant_name": restaurant["name"],
+            "restaurant_id": str(restaurant["restaurantId"]),
+            "dish_name": menu_item["name"],
+            "price_inr": _display_number(price),
+            "distance_km": restaurant.get("distanceKm"),
+            "reason": str(stop.get("reason") or "Selected to match your craving."),
+            "clue": str(stop.get("clue") or "Follow your craving to the next stop."),
+        })
+
+    if len(validated_stops) > requested_stops:
+        validated_stops = validated_stops[:requested_stops]
+        warnings.append(f"Limited the adventure to your requested {requested_stops} stops.")
+
+    # Enforce the budget using verified menu prices, not Gemma's arithmetic.
+    if budget is not None:
+        while validated_stops and sum(
+            float(stop["price_inr"]) for stop in validated_stops
+        ) > budget:
+            removed = validated_stops.pop()
+            warnings.append(
+                f"Removed {removed['dish_name']} to keep the verified food total within your ₹{_display_number(budget)} budget."
             )
 
-            veg_text = ""
+    total = sum(float(stop["price_inr"]) for stop in validated_stops)
+    total = _display_number(total)
+    remaining = _display_number(budget - float(total)) if budget is not None else None
 
-            if veg is True:
+    if not validated_stops:
+        warnings.append(
+            "No stops survived validation. Try a broader craving or a higher budget."
+        )
 
-                veg_text = " [VEG]"
+    return {
+        "title": str(plan.get("title") or "Your Seasalt Adventure"),
+        "summary": str(plan.get("summary") or "A food adventure built from available Swiggy menu data."),
+        "stops": validated_stops,
+        "total_food_cost_inr": total,
+        "remaining_budget_inr": remaining,
+        "warnings": list(dict.fromkeys(warnings)),
+    }
 
-            elif veg is False:
+def check_preference_coverage(plan, craving_profile):
+    """Check whether the validated adventure covers the user's preferences."""
 
-                veg_text = " [NON-VEG]"
+    stops = plan.get("stops", [])
+    warnings = plan.setdefault("warnings", [])
 
-            print(
-                f"  • {item_name}"
-                f" — ₹{price}"
-                f"{veg_text}"
+    flavors = [
+        str(value).casefold()
+        for value in craving_profile.get("flavors", [])
+    ]
+
+    food_types = [
+        str(value).casefold()
+        for value in craving_profile.get("food_types", [])
+    ]
+
+    selected_dishes = [
+        stop.get("dish_name", "").casefold()
+        for stop in stops
+    ]
+
+    all_dishes = " ".join(selected_dishes)
+
+    print("\nPreference coverage:")
+
+    # Check requested flavors using dish names as a basic indicator.
+    # This is a heuristic, not proof of a dish's flavor.
+    flavor_keywords = {
+        "spicy": ["spicy", "chilli", "chili", "hot", "schezwan"],
+        "sweet": [
+            "sweet", "chocolate", "choco", "cake", "pastry",
+            "lava", "dessert", "mousse", "barfi", "brownie",
+        ],
+        "sour": ["sour", "tangy", "lemon", "tamarind"],
+        "cheesy": ["cheese", "cheesy"],
+        "crunchy": ["crispy", "crunchy", "crunch"],
+    }
+
+    for flavor in flavors:
+        keywords = flavor_keywords.get(flavor, [flavor])
+
+        found = any(
+            keyword in dish
+            for keyword in keywords
+            for dish in selected_dishes
+        )
+
+        status = "Found" if found else "Not confirmed"
+        print(f"  {flavor.title()}: {status}")
+
+        if not found:
+            warnings.append(
+                f"Could not confirm a {flavor} dish from the selected menu items."
             )
 
+    # Drinks must be supported by the actual selected menu item.
+    if "drink" in food_types or "drinks" in food_types:
+        drink_keywords = [
+            "drink", "juice", "water", "soda", "cola",
+            "sprite", "pepsi", "coke", "lemonade", "shake",
+            "smoothie", "lassi", "tea", "coffee", "mojito",
+        ]
+
+        has_drink = any(
+            keyword in dish
+            for keyword in drink_keywords
+            for dish in selected_dishes
+        )
+
+        print(
+            f"  Drink: {'Found' if has_drink else 'Not found'}"
+        )
+
+        if not has_drink:
+            warnings.append(
+                "Your adventure does not include a verified drink."
+            )
+
+    # Report the number of stops.
+    requested_stops = _numeric_value(
+        craving_profile.get("stops")
+    ) or 3
+
+    print(f"  Stops: {len(stops)} of {int(requested_stops)} requested")
+
+    if len(stops) < requested_stops:
+        warnings.append(
+            f"Only {len(stops)} suitable stops were found; "
+            f"you requested {int(requested_stops)}."
+        )
+
+    # Deduplicate warnings.
+    plan["warnings"] = list(dict.fromkeys(warnings))
+
+    return plan
+
+def display_adventure(plan):
+    print()
+    print("=" * 52)
+    print(f"  {plan['title']}")
+    print("=" * 52)
+    print(plan["summary"])
+    print()
+
+    for stop in plan["stops"]:
+        print(f"STOP {stop['stop_number']}: {stop['dish_name']}")
+        print(f"  Restaurant: {stop['restaurant_name']}")
+        print(f"  Price: ₹{stop['price_inr']}")
+        if stop.get("distance_km") is not None:
+            print(f"  Distance: {stop['distance_km']} km (as returned by Swiggy)")
+        print(f"  Why this stop: {stop['reason']}")
+        print(f"  Clue: {stop['clue']}")
         print()
+
+    print("=" * 52)
+    print(f"Verified food total: ₹{plan['total_food_cost_inr']}")
+    if plan.get("remaining_budget_inr") is not None:
+        print(f"Budget remaining: ₹{plan['remaining_budget_inr']}")
+
+    if plan.get("warnings"):
+        print("\nNotes:")
+        for warning in plan["warnings"]:
+            print(f"  - {warning}")
+    print()
 
 
 # ============================================================
@@ -844,234 +1101,205 @@ async def main():
                         return
 
                     # ----------------------------------------
-                    # Ask what user wants
+                    # Initialize Gemma and parse the craving
                     # ----------------------------------------
 
                     print()
                     print("===================================")
-                    print("        WHAT ARE YOU CRAVING?")
+                    print("       SEASALT FOOD ADVENTURE")
                     print("===================================")
                     print()
-
-                    query = input(
-                        "Search for food: "
+                    user_craving = input(
+                        "What are you craving? Include budget and time if you have limits: "
                     ).strip()
 
-                    if not query:
-
-                        print(
-                            "Search query cannot be empty."
-                        )
-
+                    if not user_craving:
+                        print("Please describe what you are craving.")
                         return
 
-                    # ----------------------------------------
-                    # Search restaurants
-                    # ----------------------------------------
+                    gemma = GemmaService()
 
-                    print()
-                    print(
-                        "Searching Swiggy..."
-                    )
+                    print("\nGemma is understanding your craving...")
+                    craving_profile = gemma.parse_craving(user_craving)
+                    print("\nCraving profile:")
+                    print(json.dumps(craving_profile, indent=2, ensure_ascii=False))
 
-                    print()
+                    # Search using multiple short queries to discover more restaurants.
+                    search_queries = [
+                        str(craving_profile.get("craving") or user_craving).strip()
+                    ]
 
-                    search_arguments = {
+                    flavors = craving_profile.get("flavors", [])
+                    food_types = craving_profile.get("food_types", [])
 
-                        "addressId": address_id,
+                    for flavor in flavors:
+                        query = str(flavor).strip()
+                        if query and query not in search_queries:
+                            search_queries.append(query)
 
-                        "query": query,
+                    for food_type in food_types:
+                        query = str(food_type).strip()
+                        if query and query not in search_queries:
+                            search_queries.append(query)
 
-                        "offset": 0,
-                    }
+                    # Keep the search manageable.
+                    search_queries = search_queries[:3]
 
-                    restaurant_result = (
-                        await session.call_tool(
+                    print("\nSearching Swiggy for restaurants...")
+
+                    all_restaurants = []
+                    seen_restaurant_ids = set()
+
+                    for query in search_queries:
+                        print(f"  Searching: {query}")
+
+                        result = await session.call_tool(
                             "search_restaurants",
-                            search_arguments
-                        )
-                    )
-
-                    # ----------------------------------------
-                    # Check tool error
-                    # ----------------------------------------
-
-                    if restaurant_result.is_error:
-
-                        print()
-                        print(
-                            "Swiggy restaurant search failed."
+                            {
+                                "addressId": address_id,
+                                "query": query,
+                                "offset": 0,
+                            },
                         )
 
-                        print(
-                            restaurant_result
-                        )
+                        if result.is_error:
+                            print(f"  Search failed for: {query}")
+                            continue
 
-                        return
+                        for restaurant in extract_restaurants(result):
+                            restaurant_id = _restaurant_id(restaurant)
 
-                    # ----------------------------------------
-                    # Extract restaurants
-                    # ----------------------------------------
+                            if restaurant_id is None:
+                                continue
 
-                    restaurants = (
-                        extract_restaurants(
-                            restaurant_result
-                        )
-                    )
+                            restaurant_id = str(restaurant_id)
 
-                    # ----------------------------------------
-                    # Display restaurants
-                    # ----------------------------------------
+                            if restaurant_id in seen_restaurant_ids:
+                                continue
 
-                    open_restaurants = (
-                        display_restaurants(
-                            restaurants
-                        )
-                    )
+                            seen_restaurant_ids.add(restaurant_id)
+                            all_restaurants.append(restaurant)
+
+                    # Only consider restaurants explicitly marked OPEN.
+                    open_restaurants = [
+                        restaurant
+                        for restaurant in all_restaurants
+                        if str(
+                            restaurant.get("availabilityStatus", "")
+                        ).upper() == "OPEN"
+                    ]
 
                     if not open_restaurants:
-
+                        print("No OPEN restaurants were found.")
                         return
 
-                    # ----------------------------------------
-                    # Choose restaurant
-                    # ----------------------------------------
-
-                    selected_restaurant = (
-                        await choose_restaurant(
-                            open_restaurants
-                        )
+                    # Prioritize restaurants within the requested distance.
+                    max_distance = _numeric_value(
+                        craving_profile.get("max_distance_km")
                     )
 
-                    if not selected_restaurant:
+                    if max_distance is not None:
+                        nearby_restaurants = []
 
-                        return
-
-                    # ----------------------------------------
-                    # Get restaurant ID
-                    # ----------------------------------------
-
-                    restaurant_id = (
-                        get_restaurant_id(
-                            selected_restaurant
-                        )
-                    )
-
-                    if not restaurant_id:
-
-                        print(
-                            "Could not determine "
-                            "restaurant ID."
-                        )
-
-                        print()
-
-                        print(
-                            "Restaurant response:"
-                        )
-
-                        print(
-                            json.dumps(
-                                selected_restaurant,
-                                indent=2,
-                                default=str
+                        for restaurant in open_restaurants:
+                            distance = _numeric_value(
+                                _restaurant_distance(restaurant)
                             )
+
+                            if distance is not None and distance <= max_distance:
+                                nearby_restaurants.append(restaurant)
+
+                        print(
+                            f"Found {len(open_restaurants)} open restaurants; "
+                            f"{len(nearby_restaurants)} have verified distances "
+                            f"within {max_distance} km."
                         )
 
+                        open_restaurants = nearby_restaurants
+
+                    # Fetch menus for up to eight eligible restaurants.
+                    candidate_restaurants = open_restaurants[:8]
+
+                    if not candidate_restaurants:
+                        print(
+                            "No restaurants with verified distances satisfy "
+                            "your distance limit. Try increasing the distance "
+                            "or searching again later."
+                        )
                         return
 
-                    # ----------------------------------------
-                    # Get restaurant menu
-                    # ----------------------------------------
+                    restaurant_data = []
 
-                    print()
-                    print(
-                        "Loading restaurant menu..."
-                    )
+                    # Fetch real menus for a small candidate set to keep the
+                    # first MVP responsive and limit MCP calls.
+                    candidate_restaurants = open_restaurants[:5]
+                    restaurant_data = []
 
-                    print()
+                    for index, restaurant in enumerate(candidate_restaurants, start=1):
+                        name = _restaurant_name(restaurant)
+                        restaurant_id = _restaurant_id(restaurant)
+                        print(
+                            f"Fetching menu {index}/{len(candidate_restaurants)}: {name}..."
+                        )
 
-                    menu_arguments = {
-
-                        "addressId": address_id,
-
-                        "restaurantId": restaurant_id,
-
-                        "page": 1,
-
-                        "pageSize": 5,
-                    }
-
-                    menu_result = (
-                        await session.call_tool(
+                        menu_result = await session.call_tool(
                             "get_restaurant_menu",
-                            menu_arguments
+                            {
+                                "addressId": address_id,
+                                "restaurantId": restaurant_id,
+                                "page": 1,
+                                "pageSize": 8,
+                            },
                         )
-                    )
 
-                    if menu_result.is_error:
+                        if menu_result.is_error:
+                            print(f"  Skipped {name}: Swiggy menu request failed.")
+                            continue
 
+                        normalized = _build_restaurant_payload(
+                            restaurant,
+                            menu_result,
+                        )
+                        if normalized["menu"]:
+                            restaurant_data.append(normalized)
+                        else:
+                            print(f"  No priced menu items found for {name}; skipped.")
+
+                    if not restaurant_data:
                         print(
-                            "Failed to retrieve menu."
+                            "Could not fetch any menus with verifiable prices. "
+                            "Try again or broaden your craving."
                         )
-
-                        print(
-                            menu_result
-                        )
-
                         return
 
-                    # ----------------------------------------
-                    # Display menu
-                    # ----------------------------------------
-
-                    display_menu(
-                        menu_result
+                    print("\nGemma is creating your food adventure...")
+                    raw_plan = gemma.generate_route_plan(
+                        craving_profile,
+                        restaurant_data,
                     )
 
-                    print()
-                    print(
-                        "==================================="
-                    )
-                    print(
-                        "       SEASALT MVP MILESTONE"
-                    )
-                    print(
-                        "==================================="
-                    )
-                    print()
-
-                    print(
-                        "✓ Swiggy OAuth"
+                    # Validate all choices and recalculate totals in Python.
+                    final_plan = validate_route_plan(
+                        raw_plan,
+                        restaurant_data,
+                        craving_profile,
                     )
 
-                    print(
-                        "✓ MCP connection"
+                    final_plan = check_preference_coverage(
+                        final_plan,
+                        craving_profile,
                     )
 
-                    print(
-                        "✓ Location selection"
-                    )
+                    display_adventure(final_plan)
 
-                    print(
-                        "✓ Restaurant search"
-                    )
-
-                    print(
-                        "✓ Restaurant selection"
-                    )
-
-                    print(
-                        "✓ Restaurant menu"
-                    )
-
-                    print()
-
-                    print(
-                        "Next: connect Gemma to turn "
-                        "the user's craving into a "
-                        "personalized food quest."
-                    )
+                    print("Seasalt MVP status:")
+                    print("  ✓ Swiggy OAuth and MCP connection")
+                    print("  ✓ Location selection")
+                    print("  ✓ Gemma craving parsing")
+                    print("  ✓ Live restaurant search")
+                    print("  ✓ Real menu retrieval")
+                    print("  ✓ Gemma-generated food adventure")
+                    print("  ✓ Python validation of restaurants, dishes, and prices")
 
     finally:
 
