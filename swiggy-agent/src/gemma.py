@@ -61,7 +61,7 @@ Use this exact structure:
     "budget_inr": null,
     "time_minutes": null,
     "max_distance_km": null,
-    "stops": 1
+    "stops": 3
 }}
 
 Rules:

@@ -11,6 +11,7 @@ __pycache__/
 venv/
 env/
 ENV/
+!.env.example
 
 # Python packaging
 *.egg-info/
