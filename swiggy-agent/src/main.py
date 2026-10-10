@@ -1124,26 +1124,30 @@ async def main():
                     print("\nCraving profile:")
                     print(json.dumps(craving_profile, indent=2, ensure_ascii=False))
 
-                    # Search using multiple short queries to discover more restaurants.
-                    search_queries = [
-                        str(craving_profile.get("craving") or user_craving).strip()
-                    ]
+                    # Search the complete craving, then prioritize requested food
+                    # categories before flavor-only queries so none are silently omitted.
+                    search_queries = []
 
-                    flavors = craving_profile.get("flavors", [])
-                    food_types = craving_profile.get("food_types", [])
-
-                    for flavor in flavors:
-                        query = str(flavor).strip()
-                        if query and query not in search_queries:
+                    def add_search_query(value):
+                        query = str(value or "").strip()
+                        existing_queries = {
+                            existing.casefold() for existing in search_queries
+                        }
+                        if query and query.casefold() not in existing_queries:
                             search_queries.append(query)
 
-                    for food_type in food_types:
-                        query = str(food_type).strip()
-                        if query and query not in search_queries:
-                            search_queries.append(query)
+                    add_search_query(
+                        craving_profile.get("craving") or user_craving
+                    )
 
-                    # Keep the search manageable.
-                    search_queries = search_queries[:3]
+                    for food_type in craving_profile.get("food_types", []):
+                        add_search_query(food_type)
+
+                    for flavor in craving_profile.get("flavors", []):
+                        add_search_query(flavor)
+
+                    # Four searches balance category coverage and MCP call count.
+                    search_queries = search_queries[:4]
 
                     print("\nSearching Swiggy for restaurants...")
 
@@ -1217,22 +1221,18 @@ async def main():
 
                         open_restaurants = nearby_restaurants
 
-                    # Fetch menus for up to eight eligible restaurants.
-                    candidate_restaurants = open_restaurants[:8]
-
-                    if not candidate_restaurants:
-                        print(
-                            "No restaurants with verified distances satisfy "
-                            "your distance limit. Try increasing the distance "
-                            "or searching again later."
-                        )
-                        return
-
-                    restaurant_data = []
-
                     # Fetch real menus for a small candidate set to keep the
                     # first MVP responsive and limit MCP calls.
                     candidate_restaurants = open_restaurants[:5]
+
+                    if not candidate_restaurants:
+                        print(
+                            "No suitable restaurants with verified distances "
+                            "were found. Try increasing the distance or "
+                            "searching again later."
+                        )
+                        return
+
                     restaurant_data = []
 
                     for index, restaurant in enumerate(candidate_restaurants, start=1):

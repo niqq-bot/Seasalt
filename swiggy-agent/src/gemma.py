@@ -61,7 +61,7 @@ Use this exact structure:
     "budget_inr": null,
     "time_minutes": null,
     "max_distance_km": null,
-    "stops": 3
+    "stops": 1
 }}
 
 Rules:
@@ -299,7 +299,7 @@ Rules:
             }
 
         # Limit the prompt size.
-        eligible_restaurants = eligible_restaurants[:3]
+        eligible_restaurants = eligible_restaurants[:8]
 
         prompt = f"""
     You are Seasalt, a creative food adventure planner.
@@ -349,6 +349,11 @@ Rules:
     - Make at most {requested_stops} stops.
     - Prefer the requested flavor and food sequence.
     - If the data cannot satisfy every preference, return fewer stops.
+    - Prefer affordable items that satisfy the craving.
+    - Check the price of each candidate before selecting it.
+    - Never select an item that would exceed the remaining budget.
+    - Try other eligible dishes before returning fewer stops.
+    - Maximize the number of valid stops within the budget.
     - Use null for unknown distances.
     - Calculate the total from the selected item prices.
     - Remaining budget equals budget minus total when a budget exists.
